@@ -6,11 +6,19 @@ const RECONNECT_DELAY = 3000;
 
 interface UseWebRTCProps {
   role: 'sender' | 'receiver';
-  file: File | null;
+  files?: FileList | null;
+  selectedVideo?: string | null;
+  setAvailableFiles?: (files: any[]) => void;
   videoRef: React.RefObject<HTMLVideoElement | null>;
 }
 
-export default function useWebRTC({ role, file, videoRef }: UseWebRTCProps) {
+export default function useWebRTC({
+  role,
+  files,
+  selectedVideo,
+  setAvailableFiles,
+  videoRef,
+}: UseWebRTCProps) {
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | undefined>(undefined);
   const cleanupRef = useRef<(() => void) | undefined>(undefined);
@@ -28,7 +36,9 @@ export default function useWebRTC({ role, file, videoRef }: UseWebRTCProps) {
         console.log('WebSocket connected');
         const cleanup = setupSignaling(socket, {
           role,
-          file,
+          files,
+          selectedVideo,
+          setAvailableFiles,
           videoRef,
           send: (data) => {
             if (socket.readyState === WebSocket.OPEN) {
@@ -54,7 +64,7 @@ export default function useWebRTC({ role, file, videoRef }: UseWebRTCProps) {
       console.error('Connection error:', error);
       reconnectTimeoutRef.current = setTimeout(connect, RECONNECT_DELAY);
     }
-  }, [role, file, videoRef]);
+  }, [role, files, selectedVideo, setAvailableFiles, videoRef]);
 
   useEffect(() => {
     connect();
