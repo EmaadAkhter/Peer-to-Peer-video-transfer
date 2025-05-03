@@ -1,47 +1,38 @@
 import { RefObject } from 'react';
-import Hls from 'hls.js';
 
 const CHUNK_SIZE = 64 * 1024;
 
+interface FileMeta {
+  name: string;
+  size: number;
+  type: string;
+}
+
 interface SignalingOptions {
   role: 'sender' | 'receiver';
-  file: File | null;
+  files?: FileList | null; // Sender: all files
+  selectedVideo?: string | null; // Receiver: selected file name
+  setAvailableFiles?: (files: FileMeta[]) => void; // Receiver: update file list
   videoRef: RefObject<HTMLVideoElement | null>;
   send: (data: any) => void;
 }
 
 export function setupSignaling(socket: WebSocket, options: SignalingOptions) {
-  const { role, file, videoRef, send } = options;
+  const { role, files, selectedVideo, setAvailableFiles, videoRef, send } = options;
   let peerConnection: RTCPeerConnection | null = null;
   let dataChannel: RTCDataChannel | null = null;
   let pendingCandidates: RTCIceCandidate[] = [];
-  const receivedChunks: BlobPart[] = [];
-
-  async function addPendingCandidates() {
-    if (!peerConnection) return;
-    while (pendingCandidates.length) {
-      const candidate = pendingCandidates.shift();
-      if (candidate) {
-        try {
-          await peerConnection.addIceCandidate(candidate);
-        } catch (e) {
-          console.error('Error adding pending ICE candidate:', e);
-        }
-      }
-    }
-  }
+  let receivedChunks: BlobPart[] = [];
+  let pendingFileToSend: File | null = null;
 
   socket.onmessage = async (msg: MessageEvent) => {
     let data;
     try {
-      const text = msg.data instanceof Blob ? await msg.data.text() : msg.data;
-      data = JSON.parse(text);
-    } catch (e) {
-      console.error('Invalid JSON:', msg.data);
+      data = JSON.parse(msg.data);
+    } catch {
       return;
     }
-
-    const { type, offer, answer, candidate } = data;
+    const { type, offer, answer, candidate, files: fileList, name } = data;
 
     if (type === 'ready' && role === 'sender') {
       await setupSender();
@@ -58,65 +49,93 @@ export function setupSignaling(socket: WebSocket, options: SignalingOptions) {
       } else {
         pendingCandidates.push(iceCandidate);
       }
+    } else if (type === 'file-list' && role === 'receiver' && setAvailableFiles) {
+      setAvailableFiles(fileList);
+    } else if (type === 'file-request' && role === 'sender') {
+      const file = files && Array.from(files).find(f => f.name === name);
+      if (file) {
+        if (dataChannel && dataChannel.readyState === 'open') {
+          sendFileOverDataChannel(file);
+        } else {
+          pendingFileToSend = file;
+        }
+      }
     }
   };
 
+  async function addPendingCandidates() {
+    if (!peerConnection) return;
+    while (pendingCandidates.length) {
+      const candidate = pendingCandidates.shift();
+      if (candidate) {
+        try {
+          await peerConnection.addIceCandidate(candidate);
+        } catch (e) {
+          console.error('Error adding ICE candidate:', e);
+        }
+      }
+    }
+  }
+
   async function setupSender() {
-    peerConnection = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-    });
-    
+    peerConnection = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
     dataChannel = peerConnection.createDataChannel('file');
-    
     peerConnection.onicecandidate = (e) => {
       if (e.candidate) send({ type: 'candidate', candidate: e.candidate });
     };
 
-    dataChannel.onopen = sendChunks;
+    dataChannel.onopen = () => {
+      // Send file list metadata
+      if (files) {
+        const fileList = Array.from(files).map(f => ({
+          name: f.name,
+          size: f.size,
+          type: f.type,
+        }));
+        send({ type: 'file-list', files: fileList });
+      }
+      // If a file was requested before the channel opened, send it now
+      if (pendingFileToSend) {
+        sendFileOverDataChannel(pendingFileToSend);
+        pendingFileToSend = null;
+      }
+    };
 
     const offer = await peerConnection.createOffer();
     await peerConnection.setLocalDescription(offer);
     send({ type: 'offer', offer });
   }
 
-  function sendChunks() {
-    if (!file || !dataChannel || dataChannel.readyState !== 'open') return;
-
+  function sendFileOverDataChannel(file: File) {
+    if (!dataChannel || dataChannel.readyState !== 'open') return;
+    console.log('Sending file:', file.name, 'size:', file.size);
+    if (file.size === 0) {
+      alert('Selected file is empty!');
+      return;
+    }
     let offset = 0;
-    const totalSize = file.size;
     const reader = new FileReader();
 
     const sendNext = () => {
-      if (offset >= totalSize || dataChannel?.readyState !== 'open') {
-        console.log('File transfer complete');
+      if (offset >= file.size) {
         dataChannel?.close();
         return;
       }
-
       const chunk = file.slice(offset, offset + CHUNK_SIZE);
       reader.readAsArrayBuffer(chunk);
     };
 
     reader.onload = (e) => {
-      const chunk = e.target?.result;
-      if (chunk instanceof ArrayBuffer) {
+      const chunk = e.target?.result as ArrayBuffer;
+      if (chunk) {
+        console.log('Sending chunk of size:', chunk.byteLength);
         dataChannel?.send(chunk);
         offset += chunk.byteLength;
-        console.log(`Sent ${offset}/${totalSize} bytes`);
-        
-        if (dataChannel?.bufferedAmount && dataChannel.bufferedAmount > 8 * 1024 * 1024) {
-          dataChannel.onbufferedamountlow = () => {
-            dataChannel!.onbufferedamountlow = null;
-            sendNext();
-          };
-        } else {
-          setTimeout(sendNext, 0);
-        }
+        sendNext();
       }
     };
 
-    reader.onerror = (error) => {
-      console.error('Error reading file:', error);
+    reader.onerror = () => {
       dataChannel?.close();
     };
 
@@ -125,70 +144,30 @@ export function setupSignaling(socket: WebSocket, options: SignalingOptions) {
 
   async function setupReceiver(offer: RTCSessionDescriptionInit) {
     peerConnection = new RTCPeerConnection();
-
     peerConnection.onicecandidate = (e) => {
       if (e.candidate) send({ type: 'candidate', candidate: e.candidate });
     };
 
     peerConnection.ondatachannel = (event) => {
       const receiveChannel = event.channel;
-      let receivedSize = 0;
-      
+      receivedChunks = [];
       receiveChannel.onmessage = (e) => {
-        const data = e.data;
-        receivedChunks.push(data);
-        receivedSize += data.byteLength;
-        
-        // Log progress
-        console.log(`Received ${receivedSize} bytes`);
-      };
-
-      receiveChannel.onclose = () => {
-        try {
-          console.log('Assembling video from chunks...');
-          const completeBlob = new Blob(receivedChunks, { 
-            type: 'video/webm' 
-          });
-          console.log(`Total video size: ${completeBlob.size} bytes`);
-
-          const video = videoRef.current;
-          if (video) {
-            if (video.src) {
-              URL.revokeObjectURL(video.src);
-            }
-
-            const url = URL.createObjectURL(completeBlob);
-            video.src = url;
-            
-            // Reset video element
-            video.currentTime = 0;
-            video.load();
-
-            video.onloadedmetadata = () => {
-              console.log('Video metadata loaded');
-              video.play().catch(error => {
-                console.error('Error playing video:', error);
-              });
-            };
-
-            video.onerror = () => {
-              console.error('Video load error:', video.error);
-              // Try to recover by downloading
-              const downloadUrl = URL.createObjectURL(completeBlob);
-              const a = document.createElement('a');
-              a.href = downloadUrl;
-              a.download = 'received-video.webm';
-              a.click();
-              URL.revokeObjectURL(downloadUrl);
-            };
-          }
-        } catch (error) {
-          console.error('Error setting up video playback:', error);
+        if (e.data instanceof ArrayBuffer) {
+          console.log('Received chunk of size:', e.data.byteLength);
+          receivedChunks.push(e.data);
+        } else if (e.data instanceof Blob) {
+          e.data.arrayBuffer().then(buf => receivedChunks.push(buf));
         }
       };
-
-      receiveChannel.onerror = (error) => {
-        console.error('Data channel error:', error);
+      receiveChannel.onclose = () => {
+        const blob = new Blob(receivedChunks, { type: 'video/webm' });
+        console.log('Received blob size:', blob.size);
+        const video = videoRef.current;
+        if (video) {
+          if (video.src) URL.revokeObjectURL(video.src);
+          video.src = URL.createObjectURL(blob);
+          video.onloadedmetadata = () => video.play().catch(console.error);
+        }
       };
     };
 
@@ -198,14 +177,19 @@ export function setupSignaling(socket: WebSocket, options: SignalingOptions) {
     send({ type: 'answer', answer });
   }
 
-  // Send ready signal if receiver
+  // Initial signaling
   if (role === 'receiver') {
     send({ type: 'ready' });
   }
+  // When receiver selects a file, request it
+  if (role === 'receiver' && selectedVideo) {
+    send({ type: 'file-request', name: selectedVideo });
+  }
 
-  // Cleanup function
+  // Cleanup
   return () => {
     dataChannel?.close();
     peerConnection?.close();
   };
 }
+
