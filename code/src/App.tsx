@@ -13,7 +13,7 @@ export default function App() {
 
   return (
     <div style={{ padding: 20, fontFamily: 'sans-serif' }}>
-      <h2>P2P Video Transfer (React)</h2>
+      <h2>P2P Video Transfer </h2>
       <RoleSelector role={role} onChange={setRole} />
       {role === 'sender' && <FileInput onFileSelected={setFile} />}
       <VideoPlayer videoRef={videoRef} />
